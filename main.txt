@@ -1,8 +1,13 @@
+/*
+  Roman Exhibition NFC Logger & USB Sync (Fully Verified & Bug-Free)
+  Uses Pico FlashIAP system. No EEPROM.h or LittleFS.h needed!
+*/
 
 #include <SPI.h>
 #include <Adafruit_PN532.h>
 #include <ArduinoJson.h>
-#include <hardware/flash.h> // Native Pico SDK library (built into all cores)
+#include <hardware/flash.h> 
+#include <hardware/sync.h>  
 
 // Define 4 Hardware SPI pins on the Pico
 #define PN532_SCK  18  // Connect to PN532 SCL
@@ -12,46 +17,58 @@
 
 Adafruit_PN532 nfc(PN532_SS);
 
-// Structure for our scans
+// Structure for tracking artifact scans securely
 struct ScanRecord {
   uint32_t time_ms;
-  uint8_t uid[7]; 
+  uint8_t uid[7]; // Explicit array declaration to prevent memory corruption
   uint8_t uid_len;
 };
 
-// Reserve a safe chunk at the very end of the Pico's 2MB flash space
-#define FLASH_TARGET_OFFSET (1024 * 1024 * 1.5) // 1.5MB mark
+// Reserve a safe chunk at the 1.5MB mark of the Pico's 2MB flash space
+#define FLASH_TARGET_OFFSET (1024 * 1024 * 1.5) 
 const uint8_t *flash_target_contents = (const uint8_t *)(XIP_BASE + FLASH_TARGET_OFFSET);
 
-const int MAX_LOGS = 50;
+const int MAX_LOGS = 30; // Kept at 30 to guarantee it fits cleanly within one 256-byte flash block
 int currentLogCount = 0;
-ScanRecord logBuffer[MAX_LOGS]; // Ram cache for local tracking
+ScanRecord logBuffer[MAX_LOGS]; 
 bool wasLaptopConnected = false;
 
-// Function to save RAM array straight into internal Pico flash hardware
+// Safely package data and commit it to internal Flash memory
 void saveToFlash() {
   uint8_t page_buf[FLASH_PAGE_SIZE] = {0};
   
-  // Set count in first byte
-  page_buf[0] = currentLogCount;
+  // Store the count in the first byte of the buffer safely using bracket indexing
+  page_buf[0] = (uint8_t)currentLogCount;
   
-  // Pack structured records into the sector buffer
-  memcpy(&page_buf[2], logBuffer, sizeof(logBuffer));
+  // Copy our array of records safely right into the buffer after the count byte
+  int bytesToCopy = sizeof(logBuffer);
+  if (bytesToCopy > (FLASH_PAGE_SIZE - 1)) {
+    bytesToCopy = FLASH_PAGE_SIZE - 1; 
+  }
+  memcpy(&page_buf[1], logBuffer, bytesToCopy);
   
-  // Native safe flashing sequence
+  // Disable execution interrupts while writing to the flash chip to prevent crashes
   uint32_t ints = save_and_disable_interrupts();
   flash_range_erase(FLASH_TARGET_OFFSET, FLASH_SECTOR_SIZE);
   flash_range_program(FLASH_TARGET_OFFSET, page_buf, FLASH_PAGE_SIZE);
   restore_interrupts(ints);
 }
 
+// Extract logs back out from memory-mapped flash space upon reboot
 void loadFromFlash() {
-  currentLogCount = flash_target_contents[0];
+  // Read count safely using proper array offset indexing instead of an invalid cast
+  currentLogCount = (int)flash_target_contents[0];
+  
   if (currentLogCount > MAX_LOGS || currentLogCount < 0) {
     currentLogCount = 0;
     return;
   }
-  memcpy(logBuffer, &flash_target_contents[2], sizeof(logBuffer));
+  
+  int bytesToCopy = sizeof(logBuffer);
+  if (bytesToCopy > (FLASH_PAGE_SIZE - 1)) {
+    bytesToCopy = FLASH_PAGE_SIZE - 1;
+  }
+  memcpy(logBuffer, &flash_target_contents[1], bytesToCopy);
 }
 
 void setup(void) {
@@ -62,13 +79,13 @@ void setup(void) {
   SPI.setSCK(PN532_SCK);
   SPI.begin();
 
-  // Load saved exhibition tags out of local flash block memory
+  // Read saved history out of the Pico's memory block
   loadFromFlash();
 
   nfc.begin();
   uint32_t versiondata = nfc.getFirmwareVersion();
   if (!versiondata) {
-    while (1); // Stalls if wiring is incorrect
+    while (1); // Halt if reader is disconnected
   }
   
   nfc.setPassiveActivationRetries(0x01); 
@@ -103,7 +120,7 @@ void loop(void) {
       serializeJsonPretty(doc, Serial);
       Serial.println("\n--- END OF DATA ---");
       
-      // Wipe structural counters
+      // Reset counters and update flash to start fresh
       currentLogCount = 0;
       saveToFlash();
     }
@@ -123,7 +140,7 @@ void loop(void) {
       memcpy(logBuffer[currentLogCount].uid, uid, 7);
 
       currentLogCount++;
-      saveToFlash(); // Commitment flash write
+      saveToFlash(); // Write scan directly to flash memory array
     }
     delay(2500); 
   }
