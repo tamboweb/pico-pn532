@@ -1,54 +1,74 @@
 
-
 #include <SPI.h>
 #include <Adafruit_PN532.h>
 #include <ArduinoJson.h>
-#include <EEPROM.h>
+#include <hardware/flash.h> // Native Pico SDK library (built into all cores)
 
-// Define our 4 Hardware SPI pins on the Pico
+// Define 4 Hardware SPI pins on the Pico
 #define PN532_SCK  18  // Connect to PN532 SCL
 #define PN532_MISO 16  // Connect to PN532 TXD
 #define PN532_MOSI 19  // Connect to PN532 RXD
 #define PN532_SS   17  // Connect to PN532 SDA
 
-// Single-argument constructor tells the library to use Hardware SPI
 Adafruit_PN532 nfc(PN532_SS);
 
+// Structure for our scans
 struct ScanRecord {
   uint32_t time_ms;
-  uint8_t uid[7]; // Fixed 7-byte buffer size for safe memory copying
+  uint8_t uid[7]; 
   uint8_t uid_len;
 };
 
-const int MAX_LOGS = 50; 
+// Reserve a safe chunk at the very end of the Pico's 2MB flash space
+#define FLASH_TARGET_OFFSET (1024 * 1024 * 1.5) // 1.5MB mark
+const uint8_t *flash_target_contents = (const uint8_t *)(XIP_BASE + FLASH_TARGET_OFFSET);
+
+const int MAX_LOGS = 50;
 int currentLogCount = 0;
+ScanRecord logBuffer[MAX_LOGS]; // Ram cache for local tracking
 bool wasLaptopConnected = false;
+
+// Function to save RAM array straight into internal Pico flash hardware
+void saveToFlash() {
+  uint8_t page_buf[FLASH_PAGE_SIZE] = {0};
+  
+  // Set count in first byte
+  page_buf[0] = currentLogCount;
+  
+  // Pack structured records into the sector buffer
+  memcpy(&page_buf[2], logBuffer, sizeof(logBuffer));
+  
+  // Native safe flashing sequence
+  uint32_t ints = save_and_disable_interrupts();
+  flash_range_erase(FLASH_TARGET_OFFSET, FLASH_SECTOR_SIZE);
+  flash_range_program(FLASH_TARGET_OFFSET, page_buf, FLASH_PAGE_SIZE);
+  restore_interrupts(ints);
+}
+
+void loadFromFlash() {
+  currentLogCount = flash_target_contents[0];
+  if (currentLogCount > MAX_LOGS || currentLogCount < 0) {
+    currentLogCount = 0;
+    return;
+  }
+  memcpy(logBuffer, &flash_target_contents[2], sizeof(logBuffer));
+}
 
 void setup(void) {
   Serial.begin(115200);
 
-  // Bind hardware mapping to Pico SPI0 block pins
   SPI.setRX(PN532_MISO);
   SPI.setTX(PN532_MOSI);
   SPI.setSCK(PN532_SCK);
   SPI.begin();
 
-  // Initialize internal Pico EEPROM memory
-  EEPROM.begin(MAX_LOGS * sizeof(ScanRecord) + 2);
-  
-  currentLogCount = EEPROM.read(0);
-  if (currentLogCount > MAX_LOGS || currentLogCount < 0) {
-    currentLogCount = 0;
-    EEPROM.write(0, 0);
-    EEPROM.commit();
-  }
+  // Load saved exhibition tags out of local flash block memory
+  loadFromFlash();
 
-  // Fire up PN532 
   nfc.begin();
   uint32_t versiondata = nfc.getFirmwareVersion();
   if (!versiondata) {
-    // Stalls here? Re-verify DIP Switch 1 is ON, Switch 2 is OFF!
-    while (1); 
+    while (1); // Stalls if wiring is incorrect
   }
   
   nfc.setPassiveActivationRetries(0x01); 
@@ -56,7 +76,7 @@ void setup(void) {
 }
 
 void loop(void) {
-  // --- PART 1: DETECT LAPTOP CONNECTION & SYNC DATA ---
+  // --- PART 1: USB CONSOLE SYNC ---
   if (Serial) { 
     if (!wasLaptopConnected && currentLogCount > 0) {
       delay(1000); 
@@ -65,21 +85,17 @@ void loop(void) {
       JsonArray array = doc.to<JsonArray>();
 
       for (int i = 0; i < currentLogCount; i++) {
-        ScanRecord rec;
-        int address = 2 + (i * sizeof(ScanRecord));
-        EEPROM.get(address, rec);
-
         String uidStr = "";
-        for (uint8_t j = 0; j < rec.uid_len; j++) {
-          if (rec.uid[j] < 0x10) uidStr += "0";
-          uidStr += String(rec.uid[j], HEX);
-          if (j < rec.uid_len - 1) uidStr += ":";
+        for (uint8_t j = 0; j < logBuffer[i].uid_len; j++) {
+          if (logBuffer[i].uid[j] < 0x10) uidStr += "0";
+          uidStr += String(logBuffer[i].uid[j], HEX);
+          if (j < logBuffer[i].uid_len - 1) uidStr += ":";
         }
         uidStr.toUpperCase();
 
         JsonObject obj = array.add<JsonObject>();
         obj["scan_id"] = i + 1;
-        obj["time_running_ms"] = rec.time_ms;
+        obj["time_running_ms"] = logBuffer[i].time_ms;
         obj["artifact_uid"] = uidStr;
       }
 
@@ -87,34 +103,28 @@ void loop(void) {
       serializeJsonPretty(doc, Serial);
       Serial.println("\n--- END OF DATA ---");
       
+      // Wipe structural counters
       currentLogCount = 0;
-      EEPROM.write(0, 0);
-      EEPROM.commit();
+      saveToFlash();
     }
     wasLaptopConnected = true;
   } else {
     wasLaptopConnected = false; 
   }
 
-  // --- PART 2: SCAN FOR ARTIFACT TAGS (OFFLINE LOGGING) ---
+  // --- PART 2: OFFLINE EXHIBITION TAG CAPTURE ---
   uint8_t uid[] = { 0, 0, 0, 0, 0, 0, 0 };  
   uint8_t uidLength;                        
   
   if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength)) {
     if (currentLogCount < MAX_LOGS) {
-      ScanRecord newRecord;
-      newRecord.time_ms = millis();
-      newRecord.uid_len = uidLength;
-      memcpy(newRecord.uid, uid, 7);
+      logBuffer[currentLogCount].time_ms = millis();
+      logBuffer[currentLogCount].uid_len = uidLength;
+      memcpy(logBuffer[currentLogCount].uid, uid, 7);
 
-      int address = 2 + (currentLogCount * sizeof(ScanRecord));
-      EEPROM.put(address, newRecord);
-      
       currentLogCount++;
-      EEPROM.write(0, currentLogCount);
-      EEPROM.commit(); 
+      saveToFlash(); // Commitment flash write
     }
-    
     delay(2500); 
   }
 }
