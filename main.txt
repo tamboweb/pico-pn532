@@ -1,147 +1,163 @@
 /*
-  Roman Exhibition NFC Logger & USB Sync (Fully Verified & Bug-Free)
-  Uses Pico FlashIAP system. No EEPROM.h or LittleFS.h needed!
+  Ancient Rome Exhibit — ESP32-WROOM + PN532 (I2C)
+  The Windows laptop runs the EXISTING Flask exhibit:
+    Exhibition: http://192.168.10.100:5000
+    Artifact editor: http://192.168.10.100:5001
+
+  Install Arduino library: Seeed Arduino NFC
+  PN532 mode switches/jumpers must be set to I2C.
 */
 
-#include <SPI.h>
-#include <Adafruit_PN532.h>
-#include <ArduinoJson.h>
-#include <hardware/flash.h> 
-#include <hardware/sync.h>  
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <PN532_I2C.h>
+#include <PN532.h>
 
-// Define 4 Hardware SPI pins on the Pico
-#define PN532_SCK  18  // Connect to PN532 SCL
-#define PN532_MISO 16  // Connect to PN532 TXD
-#define PN532_MOSI 19  // Connect to PN532 RXD
-#define PN532_SS   17  // Connect to PN532 SDA
+const char* WIFI_SSID = "TambanisDevNetwork";
+const char* WIFI_PASSWORD = "PUT_YOUR_WIFI_PASSWORD_HERE";
 
-Adafruit_PN532 nfc(PN532_SS);
+// Laptop IPv4 address supplied by you:
+const char* SERVER_BASE_URL = "http://192.168.10.100:5000";
 
-// Structure for tracking artifact scans securely
-struct ScanRecord {
-  uint32_t time_ms;
-  uint8_t uid[7]; // Explicit array declaration to prevent memory corruption
-  uint8_t uid_len;
-};
+// Must match config.json api_token on the laptop.
+const char* API_TOKEN = "admin";
 
-// Reserve a safe chunk at the 1.5MB mark of the Pico's 2MB flash space
-#define FLASH_TARGET_OFFSET (1024 * 1024 * 1.5) 
-const uint8_t *flash_target_contents = (const uint8_t *)(XIP_BASE + FLASH_TARGET_OFFSET);
+#define I2C_SDA 21
+#define I2C_SCL 22
 
-const int MAX_LOGS = 30; // Kept at 30 to guarantee it fits cleanly within one 256-byte flash block
-int currentLogCount = 0;
-ScanRecord logBuffer[MAX_LOGS]; 
-bool wasLaptopConnected = false;
+PN532_I2C pn532Interface(Wire);
+PN532 nfc(pn532Interface);
 
-// Safely package data and commit it to internal Flash memory
-void saveToFlash() {
-  uint8_t page_buf[FLASH_PAGE_SIZE] = {0};
-  
-  // Store the count in the first byte of the buffer safely using bracket indexing
-  page_buf[0] = (uint8_t)currentLogCount;
-  
-  // Copy our array of records safely right into the buffer after the count byte
-  int bytesToCopy = sizeof(logBuffer);
-  if (bytesToCopy > (FLASH_PAGE_SIZE - 1)) {
-    bytesToCopy = FLASH_PAGE_SIZE - 1; 
+String lastUID = "";
+unsigned long lastPostMs = 0;
+unsigned long lastHeartbeatMs = 0;
+const unsigned long SCAN_REFRESH_MS = 1000;
+const unsigned long HEARTBEAT_MS = 5000;
+
+String uidToHex(const uint8_t* uid, uint8_t length) {
+  String value;
+  for (uint8_t i = 0; i < length; i++) {
+    if (uid[i] < 0x10) value += "0";
+    value += String(uid[i], HEX);
   }
-  memcpy(&page_buf[1], logBuffer, bytesToCopy);
-  
-  // Disable execution interrupts while writing to the flash chip to prevent crashes
-  uint32_t ints = save_and_disable_interrupts();
-  flash_range_erase(FLASH_TARGET_OFFSET, FLASH_SECTOR_SIZE);
-  flash_range_program(FLASH_TARGET_OFFSET, page_buf, FLASH_PAGE_SIZE);
-  restore_interrupts(ints);
+  value.toUpperCase();
+  return value;
 }
 
-// Extract logs back out from memory-mapped flash space upon reboot
-void loadFromFlash() {
-  // Read count safely using proper array offset indexing instead of an invalid cast
-  currentLogCount = (int)flash_target_contents[0];
-  
-  if (currentLogCount > MAX_LOGS || currentLogCount < 0) {
-    currentLogCount = 0;
-    return;
-  }
-  
-  int bytesToCopy = sizeof(logBuffer);
-  if (bytesToCopy > (FLASH_PAGE_SIZE - 1)) {
-    bytesToCopy = FLASH_PAGE_SIZE - 1;
-  }
-  memcpy(logBuffer, &flash_target_contents[1], bytesToCopy);
+bool postJson(const String& endpoint, const String& body) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  HTTPClient http;
+  String url = String(SERVER_BASE_URL) + endpoint;
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Exhibit-Token", API_TOKEN);
+  http.setConnectTimeout(2500);
+  http.setTimeout(2500);
+
+  int code = http.POST(body);
+  String response = http.getString();
+
+  Serial.print("POST ");
+  Serial.print(endpoint);
+  Serial.print(" -> ");
+  Serial.println(code);
+  if (response.length()) Serial.println(response);
+
+  http.end();
+  return code >= 200 && code < 300;
 }
 
-void setup(void) {
-  Serial.begin(115200);
-
-  SPI.setRX(PN532_MISO);
-  SPI.setTX(PN532_MOSI);
-  SPI.setSCK(PN532_SCK);
-  SPI.begin();
-
-  // Read saved history out of the Pico's memory block
-  loadFromFlash();
-
-  nfc.begin();
-  uint32_t versiondata = nfc.getFirmwareVersion();
-  if (!versiondata) {
-    while (1); // Halt if reader is disconnected
-  }
-  
-  nfc.setPassiveActivationRetries(0x01); 
-  nfc.SAMConfig();
+void sendHeartbeat() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  String ip = WiFi.localIP().toString();
+  String body = "{\"ip\":\"" + ip + "\"}";
+  postJson("/api/reader", body);
+  lastHeartbeatMs = millis();
 }
 
-void loop(void) {
-  // --- PART 1: USB CONSOLE SYNC ---
-  if (Serial) { 
-    if (!wasLaptopConnected && currentLogCount > 0) {
-      delay(1000); 
-      
-      JsonDocument doc;
-      JsonArray array = doc.to<JsonArray>();
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
 
-      for (int i = 0; i < currentLogCount; i++) {
-        String uidStr = "";
-        for (uint8_t j = 0; j < logBuffer[i].uid_len; j++) {
-          if (logBuffer[i].uid[j] < 0x10) uidStr += "0";
-          uidStr += String(logBuffer[i].uid[j], HEX);
-          if (j < logBuffer[i].uid_len - 1) uidStr += ":";
-        }
-        uidStr.toUpperCase();
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to Wi-Fi");
 
-        JsonObject obj = array.add<JsonObject>();
-        obj["scan_id"] = i + 1;
-        obj["time_running_ms"] = logBuffer[i].time_ms;
-        obj["artifact_uid"] = uidStr;
-      }
+  unsigned long started = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - started < 15000) {
+    delay(400);
+    Serial.print(".");
+  }
+  Serial.println();
 
-      Serial.println("\n--- ROMAN EXHIBITION DATA DUMP START ---");
-      serializeJsonPretty(doc, Serial);
-      Serial.println("\n--- END OF DATA ---");
-      
-      // Reset counters and update flash to start fresh
-      currentLogCount = 0;
-      saveToFlash();
-    }
-    wasLaptopConnected = true;
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("Connected. ESP32 IP: ");
+    Serial.println(WiFi.localIP());
   } else {
-    wasLaptopConnected = false; 
+    Serial.println("Wi-Fi connection failed; will retry.");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  connectWiFi();
+
+  Serial.println("Starting PN532...");
+  nfc.begin();
+  uint32_t version = nfc.getFirmwareVersion();
+
+  if (!version) {
+    Serial.println("ERROR: PN532 not found. Check power, I2C mode and wiring.");
+    while (true) delay(1000);
   }
 
-  // --- PART 2: OFFLINE EXHIBITION TAG CAPTURE ---
-  uint8_t uid[] = { 0, 0, 0, 0, 0, 0, 0 };  
-  uint8_t uidLength;                        
-  
-  if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength)) {
-    if (currentLogCount < MAX_LOGS) {
-      logBuffer[currentLogCount].time_ms = millis();
-      logBuffer[currentLogCount].uid_len = uidLength;
-      memcpy(logBuffer[currentLogCount].uid, uid, 7);
+  Serial.print("PN532 firmware ");
+  Serial.print((version >> 16) & 0xFF);
+  Serial.print(".");
+  Serial.println((version >> 8) & 0xFF);
 
-      currentLogCount++;
-      saveToFlash(); // Write scan directly to flash memory array
+  nfc.SAMConfig();
+  Serial.println("Ready. Scan an artifact tag.");
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+
+  if (WiFi.status() == WL_CONNECTED &&
+      millis() - lastHeartbeatMs >= HEARTBEAT_MS) {
+    sendHeartbeat();
+  }
+
+  uint8_t uid[7];
+  uint8_t uidLength = 0;
+  bool found = nfc.readPassiveTargetID(
+    PN532_MIFARE_ISO14443A, uid, &uidLength, 120
+  );
+
+  if (found) {
+    String uidString = uidToHex(uid, uidLength);
+    unsigned long now = millis();
+
+    // Refresh about once a second while a tag remains on the stand.
+    // The existing server uses these refreshes to know the artifact is still present.
+    if (uidString != lastUID || now - lastPostMs >= SCAN_REFRESH_MS) {
+      Serial.print("TAG ");
+      Serial.println(uidString);
+
+      String body = "{\"uid\":\"" + uidString + "\",\"source\":\"esp32\"}";
+      if (postJson("/api/nfc", body)) {
+        lastUID = uidString;
+        lastPostMs = now;
+      }
     }
-    delay(2500); 
+    delay(40);
+  } else {
+    delay(40);
   }
 }
