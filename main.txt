@@ -1,56 +1,120 @@
 
 
-#include <Wire.h>
+#include <SPI.h>
 #include <Adafruit_PN532.h>
-#include <ArduinoJson.h> // Still used to build perfect JSON formatting
+#include <ArduinoJson.h>
+#include <EEPROM.h>
 
-#define I2C_SDA 4
-#define I2C_SCL 5
-Adafruit_PN532 nfc(I2C_SDA, I2C_SCL);
+// Define our 4 Hardware SPI pins on the Pico
+#define PN532_SCK  18  // Connect to PN532 SCL
+#define PN532_MISO 16  // Connect to PN532 TXD
+#define PN532_MOSI 19  // Connect to PN532 RXD
+#define PN532_SS   17  // Connect to PN532 SDA
+
+// Single-argument constructor tells the library to use Hardware SPI
+Adafruit_PN532 nfc(PN532_SS);
+
+struct ScanRecord {
+  uint32_t time_ms;
+  uint8_t uid[7]; // Fixed 7-byte buffer size for safe memory copying
+  uint8_t uid_len;
+};
+
+const int MAX_LOGS = 50; 
+int currentLogCount = 0;
+bool wasLaptopConnected = false;
 
 void setup(void) {
   Serial.begin(115200);
-  while (!Serial && millis() < 3000) delay(10);
 
-  // Initialize PN532
+  // Bind hardware mapping to Pico SPI0 block pins
+  SPI.setRX(PN532_MISO);
+  SPI.setTX(PN532_MOSI);
+  SPI.setSCK(PN532_SCK);
+  SPI.begin();
+
+  // Initialize internal Pico EEPROM memory
+  EEPROM.begin(MAX_LOGS * sizeof(ScanRecord) + 2);
+  
+  currentLogCount = EEPROM.read(0);
+  if (currentLogCount > MAX_LOGS || currentLogCount < 0) {
+    currentLogCount = 0;
+    EEPROM.write(0, 0);
+    EEPROM.commit();
+  }
+
+  // Fire up PN532 
   nfc.begin();
   uint32_t versiondata = nfc.getFirmwareVersion();
   if (!versiondata) {
-    Serial.print("Didn't find PN532 board. Check wiring!");
-    while (1);
+    // Stalls here? Re-verify DIP Switch 1 is ON, Switch 2 is OFF!
+    while (1); 
   }
-  nfc.setPassiveActivationRetries(0xFF);
-  nfc.SAMConfig();
   
-  Serial.println("--- NFC JSON Logger Ready ---");
+  nfc.setPassiveActivationRetries(0x01); 
+  nfc.SAMConfig();
 }
 
 void loop(void) {
-  boolean success;
+  // --- PART 1: DETECT LAPTOP CONNECTION & SYNC DATA ---
+  if (Serial) { 
+    if (!wasLaptopConnected && currentLogCount > 0) {
+      delay(1000); 
+      
+      JsonDocument doc;
+      JsonArray array = doc.to<JsonArray>();
+
+      for (int i = 0; i < currentLogCount; i++) {
+        ScanRecord rec;
+        int address = 2 + (i * sizeof(ScanRecord));
+        EEPROM.get(address, rec);
+
+        String uidStr = "";
+        for (uint8_t j = 0; j < rec.uid_len; j++) {
+          if (rec.uid[j] < 0x10) uidStr += "0";
+          uidStr += String(rec.uid[j], HEX);
+          if (j < rec.uid_len - 1) uidStr += ":";
+        }
+        uidStr.toUpperCase();
+
+        JsonObject obj = array.add<JsonObject>();
+        obj["scan_id"] = i + 1;
+        obj["time_running_ms"] = rec.time_ms;
+        obj["artifact_uid"] = uidStr;
+      }
+
+      Serial.println("\n--- ROMAN EXHIBITION DATA DUMP START ---");
+      serializeJsonPretty(doc, Serial);
+      Serial.println("\n--- END OF DATA ---");
+      
+      currentLogCount = 0;
+      EEPROM.write(0, 0);
+      EEPROM.commit();
+    }
+    wasLaptopConnected = true;
+  } else {
+    wasLaptopConnected = false; 
+  }
+
+  // --- PART 2: SCAN FOR ARTIFACT TAGS (OFFLINE LOGGING) ---
   uint8_t uid[] = { 0, 0, 0, 0, 0, 0, 0 };  
   uint8_t uidLength;                        
   
-  success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, &uid, &uidLength);
-  
-  if (success) {
-    // 1. Format the UID bytes to a clean Hex string
-    String uidStr = "";
-    for (uint8_t i = 0; i < uidLength; i++) {
-      if (uid[i] < 0x10) uidStr += "0";
-      uidStr += String(uid[i], HEX);
-      if (i < uidLength - 1) uidStr += ":";
+  if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength)) {
+    if (currentLogCount < MAX_LOGS) {
+      ScanRecord newRecord;
+      newRecord.time_ms = millis();
+      newRecord.uid_len = uidLength;
+      memcpy(newRecord.uid, uid, 7);
+
+      int address = 2 + (currentLogCount * sizeof(ScanRecord));
+      EEPROM.put(address, newRecord);
+      
+      currentLogCount++;
+      EEPROM.write(0, currentLogCount);
+      EEPROM.commit(); 
     }
-    uidStr.toUpperCase();
-
-    // 2. Create the JSON entry in memory
-    JsonDocument doc;
-    doc["timestamp_ms"] = millis();
-    doc["uid"] = uidStr;
-
-    // 3. Print the JSON string directly to the computer
-    serializeJson(doc, Serial);
-    Serial.println(); // Newline to separate entries
     
-    delay(2000); // 2-second cooldown
+    delay(2500); 
   }
 }
